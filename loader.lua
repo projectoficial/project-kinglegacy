@@ -21,6 +21,7 @@ local FIXED_ACCESS_KEY = "UNIVERSE-TEST-KEY"
 local SESSION_TTL_SECONDS = 60 * 60 * 12
 local AUTH_SALT = "UniverseAuthSalt_v1_7f4a2f19"
 local BOOTSTRAP_BRIDGE_KEY = "__SYSTEMSYNC_BOOTSTRAP_BRIDGE_V1"
+local LOAD_REPORT_FOLDER = AUTH_FOLDER_NAME .. "/LoadReports"
 
 if getgenv().SystemCore_Unload then
     pcall(getgenv().SystemCore_Unload)
@@ -93,6 +94,119 @@ local function getExecutorName()
         end
     end
     return "unknown"
+end
+
+local function ensureReportFolder(path)
+    if type(makefolder) ~= "function" or type(isfolder) ~= "function" then
+        return false
+    end
+
+    local current = ""
+    local normalized = tostring(path or ""):gsub("\\", "/")
+    for segment in string.gmatch(normalized, "[^/]+") do
+        current = current == "" and segment or (current .. "/" .. segment)
+        pcall(function()
+            if not isfolder(current) then
+                makefolder(current)
+            end
+        end)
+    end
+
+    return current ~= ""
+end
+
+local function sanitizeLoadReportToken(value)
+    local sanitized = tostring(value or "unknown"):gsub("[^%w%._%-]", "_")
+    if sanitized == "" then
+        return "unknown"
+    end
+    return sanitized
+end
+
+local function classifyRemoteLoadFailure(stage, detail)
+    local lowered = string.lower(tostring(detail or ""))
+    if stage == "fetch" then
+        return "fetch"
+    end
+
+    if stage == "compile" then
+        if string.find(lowered, "unexpected symbol", 1, true)
+            or string.find(lowered, "expected", 1, true)
+            or string.find(lowered, "syntax", 1, true)
+            or string.find(lowered, "unfinished", 1, true)
+            or string.find(lowered, "near", 1, true) then
+            return "parse"
+        end
+
+        if string.find(lowered, "invalid", 1, true)
+            or string.find(lowered, "malformed", 1, true)
+            or string.find(lowered, "byte", 1, true)
+            or string.find(lowered, "utf", 1, true) then
+            return "corruption"
+        end
+
+        return "compile"
+    end
+
+    if stage == "execute" then
+        return "execution"
+    end
+
+    return tostring(stage or "unknown")
+end
+
+local function writeLocalLoadFailureReport(target, stage, detail, sourceUrl)
+    if type(writefile) ~= "function" then
+        return false
+    end
+
+    ensureReportFolder(AUTH_FOLDER_NAME)
+    ensureReportFolder(LOAD_REPORT_FOLDER)
+
+    local report = {
+        Version = 1,
+        Scope = "host",
+        Target = tostring(target or "unknown"),
+        Stage = tostring(stage or "unknown"),
+        Classification = classifyRemoteLoadFailure(stage, detail),
+        Detail = tostring(detail or ""),
+        SourceUrl = sourceUrl and tostring(sourceUrl) or nil,
+        Timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        UnixTime = getUnixTime(),
+        UserId = LocalPlayer and LocalPlayer.UserId or 0,
+        Executor = getExecutorName()
+    }
+
+    local encoded
+    local ok = pcall(function()
+        encoded = EnvironmentBase.HttpService:JSONEncode(report)
+    end)
+    if not ok or type(encoded) ~= "string" then
+        return false
+    end
+
+    local baseName = table.concat({
+        sanitizeLoadReportToken(report.Target),
+        sanitizeLoadReportToken(report.Stage),
+        sanitizeLoadReportToken(report.Classification)
+    }, "-")
+
+    pcall(function()
+        writefile(LOAD_REPORT_FOLDER .. "/" .. baseName .. "-latest.json", encoded)
+    end)
+
+    local historyPath = LOAD_REPORT_FOLDER .. "/" .. tostring(report.UnixTime) .. "-" .. baseName .. ".json"
+    local wrote = pcall(function()
+        writefile(historyPath, encoded)
+    end)
+
+    return wrote
+end
+
+local function warnRemoteLoadFailure(target, stage, detail, sourceUrl)
+    local classification = classifyRemoteLoadFailure(stage, detail)
+    writeLocalLoadFailureReport(target, stage, detail, sourceUrl)
+    warn("[Host] Remote module load failed | target=" .. tostring(target) .. " | stage=" .. tostring(stage) .. " | class=" .. tostring(classification) .. " | detail=" .. tostring(detail))
 end
 
 local function getBindingHash()
@@ -329,7 +443,7 @@ end
 function ModuleLoader:ExecuteModule(name, session)
     local fetchSuccess, bodyOrErr = self:FetchModule(name, session)
     if not fetchSuccess then
-        warn("[Host] Failed to load " .. tostring(name) .. ": " .. tostring(bodyOrErr))
+        warnRemoteLoadFailure(name, "fetch", bodyOrErr, MODULE_ENDPOINTS[name])
         return false, bodyOrErr
     end
 
@@ -342,7 +456,7 @@ function ModuleLoader:ExecuteModule(name, session)
         if name == "main" then
             AuthManager:ClearRuntimeBridge()
         end
-        warn("[Host] Error compiling " .. tostring(name) .. ": " .. tostring(loadErr))
+        warnRemoteLoadFailure(name, "compile", loadErr, MODULE_ENDPOINTS[name])
         return false, loadErr
     end
 
@@ -351,7 +465,7 @@ function ModuleLoader:ExecuteModule(name, session)
         if name == "main" then
             AuthManager:ClearRuntimeBridge()
         end
-        warn("[Host] Error executing " .. tostring(name) .. ": " .. tostring(execErr))
+        warnRemoteLoadFailure(name, "execute", execErr, MODULE_ENDPOINTS[name])
         return false, execErr
     end
 
@@ -380,7 +494,7 @@ local function buildAuthGate()
 
     local panel = Instance.new("Frame")
     panel.Name = "AuthPanel"
-    panel.Size = UDim2.new(0, 420, 0, 270)
+    panel.Size = UDim2.new(0, 420, 0, 320)
     panel.AnchorPoint = Vector2.new(0.5, 0.5)
     panel.Position = UDim2.new(0.5, 0, 0.5, 0)
     panel.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
@@ -394,33 +508,20 @@ local function buildAuthGate()
     panelStroke.Thickness = 1
     panelStroke.Parent = panel
 
-    local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, -32, 0, 32)
-    title.Position = UDim2.new(0, 16, 0, 18)
-    title.BackgroundTransparency = 1
-    title.Text = "Universe Access"
-    title.TextColor3 = Color3.fromRGB(255, 255, 255)
-    title.Font = Enum.Font.GothamBold
-    title.TextSize = 24
-    title.TextXAlignment = Enum.TextXAlignment.Left
-    title.Parent = panel
-
-    local subtitle = Instance.new("TextLabel")
-    subtitle.Size = UDim2.new(1, -32, 0, 38)
-    subtitle.Position = UDim2.new(0, 16, 0, 54)
-    subtitle.BackgroundTransparency = 1
-    subtitle.Text = "Enter your access key before loading the hub shell and game menu."
-    subtitle.TextColor3 = Color3.fromRGB(180, 180, 190)
-    subtitle.Font = Enum.Font.Gotham
-    subtitle.TextSize = 13
-    subtitle.TextWrapped = true
-    subtitle.TextXAlignment = Enum.TextXAlignment.Left
-    subtitle.TextYAlignment = Enum.TextYAlignment.Top
-    subtitle.Parent = panel
+    local iconImage = Instance.new("ImageLabel")
+    iconImage.Name = "AccessIconImage"
+    iconImage.Size = UDim2.new(0, 220, 0, 82)
+    iconImage.AnchorPoint = Vector2.new(0.5, 0)
+    iconImage.Position = UDim2.new(0.5, 0, 0, 12)
+    iconImage.BackgroundTransparency = 1
+    iconImage.BorderSizePixel = 0
+    iconImage.Image = "rbxassetid://109806584615988"
+    iconImage.ScaleType = Enum.ScaleType.Fit
+    iconImage.Parent = panel
 
     local keyBox = Instance.new("TextBox")
     keyBox.Size = UDim2.new(1, -32, 0, 48)
-    keyBox.Position = UDim2.new(0, 16, 0, 116)
+    keyBox.Position = UDim2.new(0, 16, 0, 110)
     keyBox.BackgroundColor3 = Color3.fromRGB(28, 28, 34)
     keyBox.BorderSizePixel = 0
     keyBox.PlaceholderText = "Enter access key"
@@ -441,7 +542,7 @@ local function buildAuthGate()
 
     local statusLabel = Instance.new("TextLabel")
     statusLabel.Size = UDim2.new(1, -32, 0, 20)
-    statusLabel.Position = UDim2.new(0, 16, 0, 174)
+    statusLabel.Position = UDim2.new(0, 16, 0, 168)
     statusLabel.BackgroundTransparency = 1
     statusLabel.Text = "Session will be remembered locally for 12 hours."
     statusLabel.TextColor3 = Color3.fromRGB(160, 160, 170)
@@ -451,8 +552,8 @@ local function buildAuthGate()
     statusLabel.Parent = panel
 
     local submitButton = Instance.new("TextButton")
-    submitButton.Size = UDim2.new(0.58, -18, 0, 42)
-    submitButton.Position = UDim2.new(0, 16, 1, -58)
+    submitButton.Size = UDim2.new(1, -32, 0, 42)
+    submitButton.Position = UDim2.new(0, 16, 0, 202)
     submitButton.BackgroundColor3 = Color3.fromRGB(86, 39, 255)
     submitButton.BorderSizePixel = 0
     submitButton.Text = "Unlock Hub"
@@ -463,18 +564,43 @@ local function buildAuthGate()
     submitButton.Parent = panel
     Instance.new("UICorner", submitButton).CornerRadius = UDim.new(0, 14)
 
+    local discordButton = Instance.new("TextButton")
+    discordButton.Size = UDim2.new(0.5, -20, 0, 42)
+    discordButton.Position = UDim2.new(0, 16, 0, 252)
+    discordButton.BackgroundColor3 = Color3.fromRGB(52, 52, 60)
+    discordButton.BorderSizePixel = 0
+    discordButton.Text = "Discord"
+    discordButton.TextColor3 = Color3.fromRGB(240, 240, 245)
+    discordButton.Font = Enum.Font.GothamBold
+    discordButton.TextSize = 13
+    discordButton.AutoButtonColor = false
+    discordButton.Parent = panel
+    Instance.new("UICorner", discordButton).CornerRadius = UDim.new(0, 14)
+
+    local getKeyButton = Instance.new("TextButton")
+    getKeyButton.Size = UDim2.new(0.5, -20, 0, 42)
+    getKeyButton.Position = UDim2.new(0.5, 4, 0, 252)
+    getKeyButton.BackgroundColor3 = Color3.fromRGB(52, 52, 60)
+    getKeyButton.BorderSizePixel = 0
+    getKeyButton.Text = "Get Key"
+    getKeyButton.TextColor3 = Color3.fromRGB(240, 240, 245)
+    getKeyButton.Font = Enum.Font.GothamBold
+    getKeyButton.TextSize = 13
+    getKeyButton.AutoButtonColor = false
+    getKeyButton.Parent = panel
+    Instance.new("UICorner", getKeyButton).CornerRadius = UDim.new(0, 14)
+
     local clearButton = Instance.new("TextButton")
-    clearButton.Size = UDim2.new(0.42, -14, 0, 42)
-    clearButton.Position = UDim2.new(0.58, 2, 1, -58)
-    clearButton.BackgroundColor3 = Color3.fromRGB(34, 34, 40)
+    clearButton.Size = UDim2.new(1, -32, 0, 24)
+    clearButton.Position = UDim2.new(0, 16, 1, -30)
+    clearButton.BackgroundTransparency = 1
     clearButton.BorderSizePixel = 0
     clearButton.Text = "Reset Session"
-    clearButton.TextColor3 = Color3.fromRGB(220, 220, 230)
-    clearButton.Font = Enum.Font.GothamBold
-    clearButton.TextSize = 13
+    clearButton.TextColor3 = Color3.fromRGB(170, 170, 180)
+    clearButton.Font = Enum.Font.GothamSemibold
+    clearButton.TextSize = 12
     clearButton.AutoButtonColor = false
     clearButton.Parent = panel
-    Instance.new("UICorner", clearButton).CornerRadius = UDim.new(0, 14)
 
     local authState = {
         Resolved = false,
@@ -485,6 +611,22 @@ local function buildAuthGate()
     local function setStatus(text, color)
         statusLabel.Text = text
         statusLabel.TextColor3 = color or Color3.fromRGB(160, 160, 170)
+    end
+
+    local function copyExternalLink(url, label)
+        local copyFn = type(setclipboard) == "function" and setclipboard or (type(toclipboard) == "function" and toclipboard or nil)
+        if copyFn then
+            local copied = pcall(copyFn, url)
+            if copied then
+                setStatus((label or "Link") .. " copied to clipboard.", Color3.fromRGB(255, 214, 120))
+                notify("Universe Access", (label or "Link") .. " copied to clipboard.", 3)
+                return true
+            end
+        end
+
+        setStatus("Clipboard unavailable on this executor.", Color3.fromRGB(255, 116, 116))
+        notify("Universe Access", "Clipboard unavailable.", 3)
+        return false
     end
 
     local function resolve(session)
@@ -522,6 +664,12 @@ local function buildAuthGate()
         AuthManager:ClearSession()
         keyBox.Text = ""
         setStatus("Saved key cleared.", Color3.fromRGB(255, 214, 120))
+    end)
+    connections[#connections + 1] = discordButton.MouseButton1Click:Connect(function()
+        copyExternalLink("https://discord.gg/projectoficial", "Discord")
+    end)
+    connections[#connections + 1] = getKeyButton.MouseButton1Click:Connect(function()
+        copyExternalLink("https://projectoficial.com", "Get Key")
     end)
     connections[#connections + 1] = keyBox.FocusLost:Connect(function(enterPressed)
         if enterPressed then
